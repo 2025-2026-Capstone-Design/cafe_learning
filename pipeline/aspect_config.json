@@ -1,0 +1,33 @@
+{
+  "Taste": [
+    "delicious", "tasty", "flavor", "flavors", "flavorful", "savory", "sweet", "sweetness", "sweeter",
+    "bitter", "sour", "sourness", "acidity", "acidic", "saltiness", "salty", "saltier", "nutty", "creamy",
+    "moist", "soft", "softness", "softer", "crispy", "crispiness", "crunchy", "crunchiness", "chewy",
+    "greasy", "oily", "grease", "smoky", "bland", "tasteless", "richness", "aftertaste", "aroma", "scent",
+    "espresso", "americano", "latte", "cappuccino", "flat white", "einspenner", "decaf", "caffeine",
+    "dessert", "cake", "scone", "scones", "pastry", "bread", "breads", "baguette", "salt bread",
+    "croissant", "financier", "pudding", "waffle", "cookies", "chocolate", "matcha", "vanilla"
+  ],
+  "Vibe": [
+    "atmosphere", "ambiance", "mood", "interior", "interiors", "design", "decor", "lighting",
+    "exterior", "view", "scenery", "terrace", "rooftop", "garden", "outdoor", "outside",
+    "modern", "classic", "unique", "stylish", "sophisticated", "fancy", "luxurious", "hip",
+    "quiet", "calm", "serene", "peaceful", "cozy", "comfortable", "warm", "warmth",
+    "spacious", "wide", "large", "compact", "narrow", "crowded", "hectic", "noisy",
+    "seating", "seats", "chairs", "tables", "furniture", "wood", "wooden", "glass"
+  ],
+  "Price": [
+    "price", "prices", "cost", "value", "affordable", "reasonable", "rational", "fair",
+    "cheap", "cheaper", "expensive", "pricy", "pricey", "worth", "worth it", "bundle", "bundles"
+  ],
+  "Service": [
+    "service", "staff", "employees", "owner", "barista", "chef", "friendly", "kind", "hospitality",
+    "unfriendly", "rude", "detailed", "explanation", "explanations", "description", "descriptions",
+    "waiting", "wait", "queue", "line", "turnover", "order", "ordering", "reservation", "kiosk", "pickup",
+    "fast", "quick", "faster", "slow", "efficient", "inefficient", "system", "manner"
+  ],
+  "Position": [
+    "location", "position", "accessibility", "distance", "nearby", "close", "walk", "walking",
+    "station", "exit", "alley", "street", "road", "park", "parking", "valet", "garage", "front", "nearby"
+  ]
+}
