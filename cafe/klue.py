@@ -12,7 +12,7 @@ from torch.utils.data import Dataset
 # 0. 설정 및 하이퍼파라미터
 # ==========================================
 MODEL_NAME = "klue/bert-base"
-DATA_PATH = "final_data.csv"  # 🔴 본인의 데이터 파일명으로 변경!
+DATA_PATH = "final_data.csv"
 SAVE_PATH = "./final_cafe_model"
 MAX_LEN = 128
 BATCH_SIZE = 16
