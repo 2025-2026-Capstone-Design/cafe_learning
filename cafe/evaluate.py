@@ -7,6 +7,8 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, confusion_matrix
 from transformers import BertTokenizer, BertModel
 from torch.utils.data import Dataset
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 # ==========================================
 # 0. 설정
@@ -393,6 +395,74 @@ if __name__ == "__main__":
         for case in under_detection[:3]:
             print(f"   {case['text'][:60]}... (차이: {case['diff']}개)")
 
-    print("\n" + "=" * 70)
-    print("✅ 분석 완료!")
-    print("=" * 70)
+            # -----------------------------------------
+            # [수정] 6. 시각화 리포트 생성 (한글 폰트 대응)
+            # -----------------------------------------
+            print("\n" + "=" * 70)
+            print("📊 6. 시각화 리포트 생성")
+            print("=" * 70)
+
+            # 윈도우/맥/리눅스 환경에 따른 폰트 설정
+            import platform
+
+            if platform.system() == 'Windows':
+                plt.rcParams['font.family'] = 'Malgun Gothic'
+            elif platform.system() == 'Darwin':  # Mac
+                plt.rcParams['font.family'] = 'AppleGothic'
+            else:  # Linux/Colab 등
+                plt.rcParams['font.family'] = 'NanumBarunGothic'
+
+            plt.rcParams['axes.unicode_minus'] = False  # 마이너스 기호 깨짐 방지
+
+            aspect_f1_scores = []
+            for i in range(12):
+                report = classification_report(all_labels[:, i], all_preds[:, i], output_dict=True, zero_division=0)
+                # 가중 평균 F1-Score 수집
+                aspect_f1_scores.append(report['weighted avg']['f1-score'])
+
+            # 시각화: 측면별 F1-Score 막대 그래프
+            plt.figure(figsize=(12, 8))
+            # 값에 따라 색상 변화 (낮을수록 붉은색, 높을수록 푸른색)
+            colors = sns.color_palette("RdYlGn", len(aspect_f1_scores))
+            # F1 score 기준으로 정렬해서 그리면 더 보기 좋습니다
+            perf_df = pd.DataFrame({'Aspect': ASPECT_NAMES, 'F1': aspect_f1_scores}).sort_values('F1', ascending=False)
+
+            sns.barplot(data=perf_df, x='F1', y='Aspect', palette='coolwarm')
+
+            # 그래프에 숫자 표시
+            for i, v in enumerate(perf_df['F1']):
+                plt.text(v + 0.01, i, f'{v:.3f}', va='center')
+
+            plt.title('측면별 모델 성능 (F1-Score)', fontsize=15)
+            plt.xlabel('F1-Score (0.0 ~ 1.0)')
+            plt.ylabel('평가 항목 (Aspect)')
+            plt.xlim(0, 1.1)
+            plt.grid(axis='x', linestyle='--', alpha=0.5)
+            plt.tight_layout()
+
+            plt.savefig(f"{SAVED_MODEL_PATH}/aspect_f1_report.png")
+            print(f"✅ 한글 폰트 적용 그래프 저장 완료: aspect_f1_report.png")
+
+            # 틀린 케이스만 CSV로 따로 저장 (나중에 분석용)
+            error_analysis_df = pd.DataFrame(disagreements)
+            error_analysis_df.to_csv(f"{SAVED_MODEL_PATH}/error_analysis.csv", index=False, encoding='utf-8-sig')
+            print(f"✅ 분석용 에러 리스트 저장 완료: error_analysis.csv")
+
+        # -----------------------------------------
+        # [추가] 7. 데이터 밸런스 경고 요약
+        # -----------------------------------------
+        print("\n⚠️ 성능 최적화 제언:")
+        negative_recalls = []
+        for i in range(12):
+            report = classification_report(all_labels[:, i], all_preds[:, i], output_dict=True, zero_division=0)
+            if '2' in report:  # '부정' 라벨이 있다면
+                negative_recalls.append(report['2']['recall'])
+
+        avg_neg_recall = np.mean(negative_recalls) if negative_recalls else 0
+        if avg_neg_recall < 0.5:
+            print(f"👉 [위험] 부정(Negative) 재현율이 {avg_neg_recall:.2%}로 매우 낮습니다.")
+            print(f"   학습 데이터에 '부정' 사례를 더 추가해야 실전에서 악플을 잡아낼 수 있습니다.")
+
+        print("\n" + "=" * 70)
+        print("✅ 모든 분석 및 시각화 완료!")
+        print("=" * 70)
