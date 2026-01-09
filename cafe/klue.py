@@ -16,7 +16,7 @@ DATA_PATH = "final_data.csv"
 SAVE_PATH = "./final_cafe_model"
 CHECKPOINT_PATH = "./checkpoints"  # 🆕 체크포인트 저장 경로
 MAX_LEN = 128
-BATCH_SIZE = 16
+BATCH_SIZE = 32
 EPOCHS = 5
 LEARNING_RATE = 2e-5
 SEED = 42
@@ -175,22 +175,27 @@ if __name__ == "__main__":
         exit()
 
     print(f"총 데이터 개수: {len(df)}개")
+    # 🆕 GPU 메모리 확인
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        print(f"🎮 GPU 사용: {torch.cuda.get_device_name(0)}")
+        print(f"   메모리: {torch.cuda.get_device_properties(0).total_memory / 1024 ** 3:.1f} GB")
+    else:
+        print("⚠️ CPU 사용 중")
 
-    # 🆕 2. 데이터 분할: Train(4000) / Val(500) / Test(500)
-    # 먼저 Train + Val vs Test 분리
+    # 분할
     temp_texts, test_texts, temp_labels, test_labels = train_test_split(
         df['Original_Review'].tolist(),
         df['label'].tolist(),
-        test_size=500,  # 테스트셋 500개 고정
+        test_size=500,
         random_state=SEED,
         shuffle=True
     )
 
-    # 남은 데이터에서 Train vs Val 분리
     train_texts, val_texts, train_labels, val_labels = train_test_split(
         temp_texts,
         temp_labels,
-        test_size=500,  # 검증셋 500개 고정
+        test_size=500,
         random_state=SEED,
         shuffle=True
     )
@@ -198,6 +203,29 @@ if __name__ == "__main__":
     print(f"학습 데이터: {len(train_texts)}개")
     print(f"검증 데이터: {len(val_texts)}개")
     print(f"테스트 데이터: {len(test_texts)}개")
+
+    # 💾 분할된 데이터 저장
+    print("\n💾 분할된 데이터셋 저장 중...")
+
+    pd.DataFrame({
+        'Original_Review': train_texts,
+        'label': train_labels
+    }).to_csv('split_train.csv', index=False, encoding='utf-8-sig')
+
+    pd.DataFrame({
+        'Original_Review': val_texts,
+        'label': val_labels
+    }).to_csv('split_val.csv', index=False, encoding='utf-8-sig')
+
+    pd.DataFrame({
+        'Original_Review': test_texts,
+        'label': test_labels
+    }).to_csv('split_test.csv', index=False, encoding='utf-8-sig')
+
+    print("✅ 저장 완료!")
+    print("   📁 split_train.csv")
+    print("   📁 split_val.csv")
+    print("   📁 split_test.csv")
 
     # 3. 토크나이저 및 데이터셋 준비
     tokenizer = BertTokenizer.from_pretrained(MODEL_NAME)
@@ -211,12 +239,12 @@ if __name__ == "__main__":
 
     # 🆕 5. 체크포인트에서 재개할지 확인
     resume_from_checkpoint = None
-    if os.path.exists(CHECKPOINT_PATH):
-        checkpoints = [d for d in os.listdir(CHECKPOINT_PATH) if d.startswith('checkpoint-')]
-        if checkpoints:
-            latest_checkpoint = sorted(checkpoints, key=lambda x: int(x.split('-')[1]))[-1]
-            resume_from_checkpoint = os.path.join(CHECKPOINT_PATH, latest_checkpoint)
-            print(f"🔄 체크포인트에서 재개: {resume_from_checkpoint}")
+    # if os.path.exists(CHECKPOINT_PATH):
+    #     checkpoints = [d for d in os.listdir(CHECKPOINT_PATH) if d.startswith('checkpoint-')]
+    #     if checkpoints:
+    #         latest_checkpoint = sorted(checkpoints, key=lambda x: int(x.split('-')[1]))[-1]
+    #         resume_from_checkpoint = os.path.join(CHECKPOINT_PATH, latest_checkpoint)
+    #         print(f"🔄 체크포인트에서 재개: {resume_from_checkpoint}")
 
     # 6. 학습 설정
     training_args = TrainingArguments(
@@ -234,7 +262,12 @@ if __name__ == "__main__":
         metric_for_best_model="eval_loss",  # 🆕 최고 모델 기준
         report_to="none",
         save_total_limit=3,  # 🔧 최근 3개 체크포인트 보관
-        resume_from_checkpoint=resume_from_checkpoint  # 🆕 재개 설정
+        #resume_from_checkpoint=resume_from_checkpoint,  # 🆕 재개 설정
+        # 🆕 GPU 최적화 옵션
+        fp16 = True,  # 혼합 정밀도 (속도 2배↑, 메모리 절약)
+        dataloader_num_workers = 2,  # 데이터 로딩 병렬화
+        dataloader_pin_memory = False,  # 경고 제거
+        gradient_checkpointing = False,  # 메모리 부족 시 True로
     )
 
     # 7. 학습 시작
@@ -246,7 +279,7 @@ if __name__ == "__main__":
         eval_dataset=val_dataset
     )
 
-    trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+    trainer.train()
 
     # 8. 최종 모델 저장
     print(f"💾 최종 모델 저장 중... ({SAVE_PATH})")
