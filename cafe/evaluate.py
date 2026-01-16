@@ -75,31 +75,69 @@ class CafeAspectDataset(Dataset):
         }
 
 
-# ==========================================
-# 2. 모델 정의
-# ==========================================
-class MultiOutputBert(nn.Module):
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=1, gamma=1.5, weight=None):
+        super(FocalLoss, self).__init__()
+        self.weight = weight
+        self.gamma = gamma
+        self.ce_loss = nn.CrossEntropyLoss(weight=weight, reduction='none')
+
+    def forward(self, inputs, targets):
+        log_pt = -self.ce_loss(inputs, targets)
+        pt = torch.exp(log_pt)
+        loss = ((1 - pt) ** self.gamma) * self.ce_loss(inputs, targets)
+        return loss.mean()
+
+
+# 기존 DualHeadBert 클래스 전체 삭제 (91~159번째 줄)
+
+# 수정: 아래 클래스로 교체 ⬇️
+class HybridAspectSentiment(nn.Module):
     def __init__(self, model_name):
-        super(MultiOutputBert, self).__init__()
+        super(HybridAspectSentiment, self).__init__()
         self.bert = BertModel.from_pretrained(model_name)
         self.drop = nn.Dropout(p=0.3)
-        self.out = nn.Linear(self.bert.config.hidden_size, 12 * 4)
 
-    def forward(self, input_ids, attention_mask, labels=None):
+        self.aspect_detector = nn.Linear(self.bert.config.hidden_size, 12)
+        self.sentiment_classifier = nn.Linear(self.bert.config.hidden_size + 12, 12 * 4)
+
+    def forward(self, input_ids, attention_mask, labels=None, class_weights=None):
         outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
         pooled_output = outputs.pooler_output
         output = self.drop(pooled_output)
-        logits = self.out(output).view(-1, 12, 4)
+
+        aspect_logits = self.aspect_detector(output)
+        aspect_probs = torch.sigmoid(aspect_logits)
+
+        combined = torch.cat([output, aspect_probs], dim=1)
+        sentiment_logits = self.sentiment_classifier(combined)
+        sentiment_logits = sentiment_logits.view(-1, 12, 4)
 
         loss = None
         if labels is not None:
-            loss_fct = nn.CrossEntropyLoss()
-            loss = 0
+            aspect_labels = (labels != 0).float()
+            aspect_loss = nn.BCEWithLogitsLoss()(aspect_logits, aspect_labels)
+
+            if class_weights is not None:
+                weights = class_weights.to(labels.device)
+            else:
+                weights = None
+
+            sentiment_loss_fct = nn.CrossEntropyLoss(weight=weights)
+            sentiment_loss = 0
             for i in range(12):
-                loss += loss_fct(logits[:, i, :], labels[:, i])
+                sentiment_loss += sentiment_loss_fct(
+                    sentiment_logits[:, i, :],
+                    labels[:, i]
+                )
 
-        return {'loss': loss, 'logits': logits}
+            loss = 0.2 * aspect_loss + sentiment_loss
 
+        return {
+            'loss': loss,
+            'logits': sentiment_logits,
+            'aspect_probs': aspect_probs
+        }
 
 # ==========================================
 # 메인 실행
@@ -151,7 +189,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\n💾 모델 로드 중... ({SAVED_MODEL_PATH})")
 
-    model = MultiOutputBert(MODEL_NAME).to(device)
+    model = HybridAspectSentiment(MODEL_NAME).to(device)
     model.load_state_dict(torch.load(f"{SAVED_MODEL_PATH}/model_state_dict.pt",
                                      map_location=device))
     model.eval()
@@ -171,8 +209,9 @@ if __name__ == "__main__":
             labels = batch['labels'].to(device)
 
             outputs = model(input_ids, attention_mask)
-            logits = outputs['logits']
-            preds = torch.argmax(logits, dim=2)
+
+            logits = outputs['logits']  # [batch, 12, 4]
+            preds = torch.argmax(logits, dim=2)  # [batch, 12]
 
             all_preds.append(preds.cpu())
             all_labels.append(labels.cpu())
@@ -220,12 +259,19 @@ if __name__ == "__main__":
             labels = batch['labels'].to(device)
 
             outputs = model(input_ids, attention_mask)
-            logits = outputs['logits']
+            # Hybrid 모델 신뢰도 계산
+            aspect_probs = outputs['aspect_probs'].squeeze()  # [12]
+            logits = outputs['logits'].squeeze()  # [12, 4]
+            sentiment_probs = torch.softmax(logits, dim=1)  # [12, 4]
+            preds = torch.argmax(logits, dim=1)  # [12]
 
-            # 확률 계산
-            probs = torch.softmax(logits, dim=2).squeeze()
-            preds = torch.argmax(probs, dim=1)
-            confidences = torch.max(probs, dim=1).values
+            # 신뢰도 계산 (측면 확률 × 감성 확률)
+            confidences = torch.zeros(12)
+            for i in range(12):
+                if preds[i] != 0:  # 해당없음이 아니면
+                    confidences[i] = aspect_probs[i] * sentiment_probs[i, preds[i]]
+                else:  # 해당없음이면
+                    confidences[i] = sentiment_probs[i, 0]  # 해당없음 확률
 
             # 평균 신뢰도
             avg_conf = confidences.mean().item()
@@ -678,3 +724,113 @@ if __name__ == "__main__":
 
     else:
         print("🎉 와우! 부정 감성에 대한 오류가 하나도 없습니다.")
+
+# ==========================================
+# 🆕 부정/중립 오답의 실제 원인 분석
+# ==========================================
+print("\n" + "=" * 70)
+print("🔬 부정/중립 오답 키워드 분석")
+print("=" * 70)
+
+from collections import Counter
+import re
+
+# 부정/중립 오답 텍스트만 추출
+negative_missed_texts = [err['Text'] for err in negative_errors if err['Type'] == '놓친 부정(Missed)']
+neutral_missed_texts = [err['Text'] for err in neutral_errors if err['Type'] == '놓친 중립(Missed)']
+
+
+# 한국어 형태소 추출 (간단 버전)
+def extract_keywords(text):
+    # 공백, 특수문자 기준으로 단어 분리
+    words = re.findall(r'[가-힣]+', text)
+    # 2글자 이상 단어만
+    return [w for w in words if len(w) >= 2]
+
+
+# 부정 오답에서 자주 나오는 단어
+if negative_missed_texts:
+    print("\n[ 놓친 부정 리뷰에서 자주 나온 표현 TOP 20 ]")
+    all_words = []
+    for text in negative_missed_texts:
+        all_words.extend(extract_keywords(text))
+
+    word_freq = Counter(all_words)
+    for word, count in word_freq.most_common(20):
+        print(f"  '{word}' : {count}번")
+
+# 중립 오답에서 자주 나오는 단어
+if neutral_missed_texts:
+    print("\n[ 놓친 중립 리뷰에서 자주 나온 표현 TOP 20 ]")
+    all_words = []
+    for text in neutral_missed_texts:
+        all_words.extend(extract_keywords(text))
+
+    word_freq = Counter(all_words)
+    for word, count in word_freq.most_common(20):
+        print(f"  '{word}' : {count}번")
+
+# 🔥 핵심: 부정/중립 특유의 표현 찾기
+print("\n" + "=" * 70)
+print("💡 학습 데이터에 추가해야 할 표현 후보")
+print("=" * 70)
+
+# 부정 키워드인데 자주 놓친 것
+negative_keywords = ['별로', '실망', '아쉽', '그냥', '비싸', '불친절', '짜증']
+for keyword in negative_keywords:
+    missed_count = sum(1 for text in negative_missed_texts if keyword in text)
+    if missed_count > 0:
+        print(f"⚠️ '{keyword}' 포함 부정 리뷰를 {missed_count}번 놓침")
+
+# 중립 키워드인데 자주 놓친 것
+neutral_keywords = ['괜찮', '그냥', '평범', '무난', '보통', '나쁘지않', '애매']
+for keyword in neutral_keywords:
+    missed_count = sum(1 for text in neutral_missed_texts if keyword in text)
+    if missed_count > 0:
+        print(f"⚠️ '{keyword}' 포함 중립 리뷰를 {missed_count}번 놓침")
+
+# ==========================================
+# 🆕 대표 오답 케이스 상세 분석
+# ==========================================
+print("\n" + "=" * 70)
+print("🔎 대표 오답 케이스 5개 상세 분석")
+print("=" * 70)
+
+# 부정을 놓친 케이스 5개
+if negative_missed_texts:
+    print("\n[ 부정을 놓친 케이스 ]")
+    for i, case in enumerate(negative_errors[:5], 1):
+        if case['Type'] == '놓친 부정(Missed)':
+            print(f"\n{i}. {case['Text']}")
+            print(f"   측면: {case['Aspect']}")
+            print(f"   실제: {case['True']} → 예측: {case['Pred']}")
+
+            # 이 리뷰를 모델에 다시 넣어서 신뢰도 확인
+            encoding = tokenizer.encode_plus(
+                case['Text'],
+                add_special_tokens=True,
+                max_length=MAX_LEN,
+                return_token_type_ids=False,
+                padding='max_length',
+                truncation=True,
+                return_attention_mask=True,
+                return_tensors='pt',
+            )
+
+            with torch.no_grad():
+                outputs = model(
+                    encoding['input_ids'].to(device),
+                    encoding['attention_mask'].to(device)
+                )
+
+                aspect_idx = ASPECT_NAMES.index(case['Aspect'])
+                aspect_prob = outputs['aspect_probs'][0, aspect_idx].item()
+                logits = outputs['logits'][0, aspect_idx]
+                sent_probs = torch.softmax(logits, dim=0)
+
+                print(f"   📊 모델 판단:")
+                print(f"      측면 감지: {aspect_prob:.1%}")
+                print(f"      해당없음: {sent_probs[0]:.1%}")
+                print(f"      긍정: {sent_probs[1]:.1%}")
+                print(f"      부정: {sent_probs[2]:.1%}")  # ← 이게 낮으면 학습 부족
+                print(f"      중립: {sent_probs[3]:.1%}")

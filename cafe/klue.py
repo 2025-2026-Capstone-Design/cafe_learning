@@ -89,7 +89,7 @@ class CafeAspectDataset(Dataset):
 # 🆕 Focal Loss 정의
 # ==========================================
 class FocalLoss(nn.Module):
-    def __init__(self, alpha=1, gamma=1.5, weight=None):
+    def __init__(self, alpha=1, gamma=1.0, weight=None):
         super(FocalLoss, self).__init__()
         self.weight = weight  # 클래스 가중치
         self.gamma = gamma  # 어려운 샘플 집중도 (2.0 권장)
@@ -128,71 +128,136 @@ class FocalLoss(nn.Module):
 #
 #         return {'loss': loss, 'logits': logits}
 
+# # ==========================================
+# # 🆕 Dual-Head 모델 정의 (기존 91-113번 줄 교체)
+# # ==========================================
+# class DualHeadBert(nn.Module):
+#     def __init__(self, model_name):
+#         super(DualHeadBert, self).__init__()
+#         self.bert = BertModel.from_pretrained(model_name)
+#         self.drop = nn.Dropout(p=0.3)
+#
+#         # Head 1: 측면 감지 (12개 측면에 대해 있다/없다)
+#         self.aspect_head = nn.Linear(self.bert.config.hidden_size, 12)
+#
+#         # Head 2: 감성 분류 (12개 측면 × 3개 감성 = 36)
+#         self.sentiment_head = nn.Linear(self.bert.config.hidden_size, 12 * 3)
+#
+#     def forward(self, input_ids, attention_mask, labels=None, class_weights=None):
+#         outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+#         pooled_output = outputs.pooler_output
+#         output = self.drop(pooled_output)
+#
+#         # 측면 감지 (sigmoid)
+#         aspect_logits = self.aspect_head(output)  # [batch, 12]
+#
+#         # 감성 분류
+#         sentiment_logits = self.sentiment_head(output).view(-1, 12, 3)  # [batch, 12, 3]
+#
+#         loss = None
+#         if labels is not None:
+#             # 라벨 분리
+#             aspect_labels = (labels != 0).float()  # [batch, 12]
+#             sentiment_labels = torch.where(
+#                 labels > 0,
+#                 labels - 1,  # 1→0, 2→1, 3→2
+#                 torch.zeros_like(labels)
+#             )
+#
+#             # Loss 1: 측면 감지
+#             pos_weight = torch.tensor([3.5] * 12).to(labels.device)  #  추가 -> 관련있음 예측하면 loss 2배 더 줌
+#             aspect_loss_fct = nn.BCEWithLogitsLoss(pos_weight=pos_weight)  # 🔧 수정
+#             aspect_loss = aspect_loss_fct(aspect_logits, aspect_labels)
+#             aspect_loss = aspect_loss_fct(aspect_logits, aspect_labels)
+#
+#             # Loss 2: 감성 분류
+#             if class_weights is not None:
+#                 sentiment_weights = class_weights.to(labels.device)  # 긍정, 부정, 중립만
+#             else:
+#                 sentiment_weights = None
+#
+#             sentiment_loss_fct = FocalLoss(gamma=1.5, weight=sentiment_weights)
+#             sentiment_loss = 0
+#
+#             for i in range(12):
+#                 mask = aspect_labels[:, i] == 1
+#                 if mask.sum() > 0:
+#                     sentiment_loss += sentiment_loss_fct(
+#                         sentiment_logits[mask, i, :],
+#                         sentiment_labels[mask, i]
+#                     )
+#
+#             # 전체 Loss
+#             loss = aspect_loss + 1.0 * sentiment_loss
+#
+#         return {
+#             'loss': loss,
+#             'aspect_logits': aspect_logits,
+#             'sentiment_logits': sentiment_logits
+#         }
+
 # ==========================================
-# 🆕 Dual-Head 모델 정의 (기존 91-113번 줄 교체)
+# 🆕 Hybrid 모델: 측면 정보를 감성 분류에 활용
 # ==========================================
-class DualHeadBert(nn.Module):
+class HybridAspectSentiment(nn.Module):
     def __init__(self, model_name):
-        super(DualHeadBert, self).__init__()
+        super(HybridAspectSentiment, self).__init__()
         self.bert = BertModel.from_pretrained(model_name)
         self.drop = nn.Dropout(p=0.3)
 
-        # Head 1: 측면 감지 (12개 측면에 대해 있다/없다)
-        self.aspect_head = nn.Linear(self.bert.config.hidden_size, 12)
+        # Step 1: 측면 감지 (보조 정보)
+        self.aspect_detector = nn.Linear(self.bert.config.hidden_size, 12)
 
-        # Head 2: 감성 분류 (12개 측면 × 3개 감성 = 36)
-        self.sentiment_head = nn.Linear(self.bert.config.hidden_size, 12 * 3)
+        # Step 2: 측면 정보 + BERT 임베딩 결합
+        # 768(BERT) + 12(aspect probs) = 780
+        self.sentiment_classifier = nn.Linear(self.bert.config.hidden_size + 12, 12 * 4)
 
     def forward(self, input_ids, attention_mask, labels=None, class_weights=None):
         outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-        pooled_output = outputs.pooler_output
+        pooled_output = outputs.pooler_output  # [batch, 768]
         output = self.drop(pooled_output)
 
-        # 측면 감지 (sigmoid)
-        aspect_logits = self.aspect_head(output)  # [batch, 12]
+        # Step 1: 측면 확률 계산
+        aspect_logits = self.aspect_detector(output)  # [batch, 12]
+        aspect_probs = torch.sigmoid(aspect_logits)  # [batch, 12]
 
-        # 감성 분류
-        sentiment_logits = self.sentiment_head(output).view(-1, 12, 3)  # [batch, 12, 3]
+        # Step 2: BERT 임베딩 + 측면 확률 결합
+        combined = torch.cat([output, aspect_probs], dim=1)  # [batch, 780]
+
+        # Step 3: 감성 분류
+        sentiment_logits = self.sentiment_classifier(combined)
+        sentiment_logits = sentiment_logits.view(-1, 12, 4)  # [batch, 12, 4]
 
         loss = None
         if labels is not None:
-            # 라벨 분리
+            # Loss 1: 측면 감지 (보조 loss)
             aspect_labels = (labels != 0).float()  # [batch, 12]
-            sentiment_labels = torch.where(
-                labels > 0,
-                labels - 1,  # 1→0, 2→1, 3→2
-                torch.zeros_like(labels)
-            )
+            aspect_loss = nn.BCEWithLogitsLoss()(aspect_logits, aspect_labels)
 
-            # Loss 1: 측면 감지
-            aspect_loss_fct = nn.BCEWithLogitsLoss()
-            aspect_loss = aspect_loss_fct(aspect_logits, aspect_labels)
-
-            # Loss 2: 감성 분류
+            # Loss 2: 감성 분류 (주 loss)
             if class_weights is not None:
-                sentiment_weights = class_weights.to(labels.device)  # 긍정, 부정, 중립만
+                weights = class_weights.to(labels.device)
             else:
-                sentiment_weights = None
+                weights = None
 
-            sentiment_loss_fct = FocalLoss(gamma=1.5, weight=sentiment_weights)
+            sentiment_loss_fct = nn.CrossEntropyLoss(weight=weights)
             sentiment_loss = 0
-
             for i in range(12):
-                mask = aspect_labels[:, i] == 1
-                if mask.sum() > 0:
-                    sentiment_loss += sentiment_loss_fct(
-                        sentiment_logits[mask, i, :],
-                        sentiment_labels[mask, i]
-                    )
+                sentiment_loss += sentiment_loss_fct(
+                    sentiment_logits[:, i, :],
+                    labels[:, i]
+                )
 
-            # 전체 Loss
-            loss = aspect_loss + 2.0 * sentiment_loss
+            # 전체 Loss: 감성 분류가 주, 측면 감지가 보조
+            loss = 0.2 * aspect_loss + sentiment_loss
 
         return {
             'loss': loss,
-            'aspect_logits': aspect_logits,
-            'sentiment_logits': sentiment_logits
+            'logits': sentiment_logits,
+            'aspect_probs': aspect_probs
         }
+
+
 
 
 # ==========================================
@@ -248,30 +313,30 @@ def predict_review(model, tokenizer, review_text, device):
     with torch.no_grad():
         outputs = model(input_ids, attention_mask)
 
-        # 측면 감지
-        aspect_probs = torch.sigmoid(outputs['aspect_logits']).squeeze()
-        aspect_detected = (aspect_probs > 0.5).cpu().numpy()
-
-        # 감성 분류
-        sentiment_probs = torch.softmax(outputs['sentiment_logits'], dim=2).squeeze()
-        sentiment_preds = torch.argmax(sentiment_probs, dim=1).cpu().numpy()
+        # Hybrid 모델 출력
+        aspect_probs = outputs['aspect_probs'].squeeze().cpu().numpy()
+        logits = outputs['logits'].squeeze()  # [12, 4]
+        sentiment_probs = torch.softmax(logits, dim=1)
+        preds = torch.argmax(logits, dim=1).cpu().numpy()
 
     print(f"\n📝 리뷰: {review_text}")
-    print("-" * 40)
+    print("-" * 60)
 
     detected = False
     for idx in range(12):
-        if aspect_detected[idx]:
+        # 측면 확률이 0.3 이상이거나, 감성이 해당없음이 아니면 출력
+        if aspect_probs[idx] > 0.3 or preds[idx] != 0:
             aspect = ASPECT_NAMES[idx]
-            sentiment_code = sentiment_preds[idx] + 1  # 0→1(긍정), 1→2(부정), 2→3(중립)
-            sentiment = SENTIMENT_NAMES[sentiment_code]
-            confidence = aspect_probs[idx].item()
-            print(f"👉 [{aspect}] : {sentiment} (신뢰도: {confidence:.1%})")
+            sentiment = SENTIMENT_NAMES[preds[idx]]
+            sent_conf = sentiment_probs[idx, preds[idx]].item()
+
+            print(f"👉 [{aspect:12s}] {sentiment:6s} "
+                  f"(측면: {aspect_probs[idx]:.1%}, 감성: {sent_conf:.1%})")
             detected = True
 
     if not detected:
         print("👉 분석된 감성이 없습니다.")
-    print("-" * 40)
+    print("-" * 60)
 
 # ==========================================
 # 메인 실행 코드
@@ -370,10 +435,11 @@ if __name__ == "__main__":
     #     2.0  # 중립
     # ], dtype=torch.float)
 
-    sentiment_weights = torch.tensor([
+    class_weights = torch.tensor([
+        0.5,
         1.0,  # 긍정 (index 0)
         4.0,  # 부정 (index 1)
-        8.0  # 중립 (index 2)
+        6.0  # 중립 (index 2)
     ], dtype=torch.float)
     # ==========================================
     # 🆕 WeightedRandomSampler 준비
@@ -396,9 +462,9 @@ if __name__ == "__main__":
 
         # 가중치 부여 전략
         if has_negative:
-            weight = 8.0  # 부정 최우선
+            weight = 3.0  # 부정 최우선
         elif has_neutral:
-            weight = 15.0  # 중립 차순위
+            weight = 4.0  # 중립 차순위
         elif has_positive:
             weight = 1.0  # 긍정은 기본
         else:
@@ -428,7 +494,7 @@ if __name__ == "__main__":
 
     # 4. 모델 초기화
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = DualHeadBert(MODEL_NAME).to(device)
+    model = HybridAspectSentiment(MODEL_NAME).to(device)
 
     # 5. 체크포인트에서 재개할지 확인
     resume_from_checkpoint = None
@@ -470,7 +536,7 @@ if __name__ == "__main__":
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
-        class_weights=sentiment_weights.to(device),
+        class_weights=class_weights.to(device),
         train_sampler=sampler
     )
 
@@ -503,18 +569,8 @@ if __name__ == "__main__":
 
             outputs = model(input_ids, attention_mask)
 
-            # 🆕 Dual-Head 예측 처리
-            aspect_probs = torch.sigmoid(outputs['aspect_logits'])
-            aspect_detected = (aspect_probs > 0.5).long()
-
-            sentiment_preds = torch.argmax(outputs['sentiment_logits'], dim=2)
-
-            # 최종 예측 조합
-            preds = torch.where(
-                aspect_detected == 1,
-                sentiment_preds + 1,  # 0→1, 1→2, 2→3
-                torch.zeros_like(sentiment_preds)
-            )
+            logits = outputs['logits']  # [batch, 12, 4]
+            preds = torch.argmax(logits, dim=2)  # [batch, 12]
 
             all_preds.append(preds.cpu())
             all_labels.append(labels.cpu())
